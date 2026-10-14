@@ -1,0 +1,38 @@
+/* 全局基础样式：只做通用重置和主题变量，页面样式都写在各自组件的 <style scoped> 里 */
+:root {
+  --primary: #1e6fd9;
+  --text-main: #1f2d3d;
+  --text-sub: #6b7a90;
+  --bg-page: #f5f8fd;
+
+  font-family: system-ui, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text-main);
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-page);
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+a {
+  color: var(--primary);
+  text-decoration: none;
+}
+
+button {
+  font-family: inherit;
+}
