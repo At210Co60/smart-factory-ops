@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import * as echarts from 'echarts'
 import request from '@/api'
-import { DEVICES, loadOrders } from '@/mock/data'
+import { DEVICES, DEVICE_STATUS, PRIORITY, loadOrders } from '@/mock/data'
+import { countBy } from '@/utils/stats'
 
 // localStorage 键名：记住用户上次查的城市，刷新/重开浏览器都保留
 const CITY_KEY = 'fop_weather_city_v1'
@@ -137,24 +138,159 @@ function buildChartOption() {
   }
 }
 
-function resizeChart() { chart?.resize() }
+/* ============= 数据文件分析：设备状态分布饼图 + 各车间设备数量柱状图 ============= */
+// 统计结果用 computed 算出来：DEVICES 是固定数组，countBy 只算一次
+const statusData = computed(() => countBy(DEVICES, (d) => DEVICE_STATUS[d.status].label))
+const shopData = computed(() => countBy(DEVICES, (d) => d.shop))
+
+const statusChartEl = ref<HTMLDivElement | null>(null)
+const shopChartEl = ref<HTMLDivElement | null>(null)
+let statusChart: echarts.ECharts | null = null
+let shopChart: echarts.ECharts | null = null
+
+// 状态配色和状态标签保持一致，视觉不跳脱
+const STATUS_COLORS: Record<string, string> = {
+  '运行': '#2bbf6a',
+  '故障': '#d93939',
+  '停机': '#8a93ab',
+  '维护中': '#f08c2e',
+}
+
+/* ============= 工单优先级分布柱状图 ============= */
+// 工单是活数据(loadOrders()从 localStorage 读)，每次新建/处理/完成都更新一次
+// 优先级有固定顺序(高/中/低),即便某一档暂时没有也要补 0,否则柱子会缺一根
+const priorityData = computed(() => {
+  const orders = loadOrders()
+  const counted = countBy(orders, (o) => o.priority)
+  return (['high', 'mid', 'low'] as const).map((k) => ({
+    name: PRIORITY[k].label,
+    value: counted.find((x) => x.name === k)?.value ?? 0,
+  }))
+})
+
+const priorityChartEl = ref<HTMLDivElement | null>(null)
+let priorityChart: echarts.ECharts | null = null
+
+// 优先级配色：红(高) / 橙(中) / 绿(低)，跟 PRIORITY.color 视觉统一
+const PRIORITY_COLORS: Record<string, string> = {
+  '高': '#d93939',
+  '中': '#f08c2e',
+  '低': '#2bbf6a',
+}
+
+function buildStatusOption() {
+  return {
+    // 饼图没有 xAxis / yAxis
+    tooltip: { trigger: 'item', formatter: '{b}：{c} 台（{d}%）' },
+    legend: {
+      bottom: 0,
+      left: 'center',
+      icon: 'circle',
+      textStyle: { color: '#6b7a90', fontSize: 12 },
+    },
+    series: [
+      {
+        type: 'pie',
+        radius: '62%',
+        center: ['50%', '46%'],
+        itemStyle: { borderColor: '#fff', borderWidth: 2 },
+        label: { formatter: '{b} {c} 台', fontSize: 12, color: '#1f2d3d' },
+        data: statusData.value.map((it) => ({
+          ...it,
+          itemStyle: { color: STATUS_COLORS[it.name] || '#8a93ab' },
+        })),
+      },
+    ],
+  }
+}
+
+function buildShopOption() {
+  // 柱状图要多一步拆列：name 列给 X 轴，value 列给 series
+  const shopNames = shopData.value.map((it) => it.name)
+  const shopCounts = shopData.value.map((it) => it.value)
+  return {
+    tooltip: { trigger: 'axis' },
+    xAxis: { type: 'category', data: shopNames },
+    yAxis: { type: 'value', name: '台数' },
+    series: [
+      {
+        type: 'bar',
+        barMaxWidth: 48,
+        itemStyle: { color: '#2563eb', borderRadius: [4, 4, 0, 0] },
+        label: { show: true, position: 'top', color: '#1f2d3d' },
+        data: shopCounts,
+      },
+    ],
+  }
+}
+
+function buildPriorityOption() {
+  // 同样是拆列：name 列给 X 轴(三档:高/中/低)，value 列给 series.data
+  const names = priorityData.value.map((it) => it.name)
+  const values = priorityData.value.map((it) => it.value)
+  return {
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
+    xAxis: { type: 'category', data: names },
+    yAxis: { type: 'value', name: '单数' },
+    series: [
+      {
+        type: 'bar',
+        barMaxWidth: 48,
+        // 每根柱子按档位取色,而不是统一一个色
+        itemStyle: {
+          borderRadius: [4, 4, 0, 0],
+          color: (params: any) => PRIORITY_COLORS[names[params.dataIndex]] || '#8a93ab',
+        },
+        label: { show: true, position: 'top', color: '#1f2d3d' },
+        data: values,
+      },
+    ],
+  }
+}
+
+// 窗口变化时四个图表都重绘（具名函数，才能被 removeEventListener 删掉）
+function onResize() {
+  chart?.resize()
+  statusChart?.resize()
+  shopChart?.resize()
+  priorityChart?.resize()
+}
 
 onMounted(() => {
   loadData()
   refreshPendingCount()
 
-  // 初始化图表
+  // 初始化图表：init 必须在 onMounted 里，DOM 渲染完才能拿到容器
   if (chartEl.value) {
     chart = echarts.init(chartEl.value)
     chart.setOption(buildChartOption())
-    window.addEventListener('resize', resizeChart)
   }
+  if (statusChartEl.value) {
+    statusChart = echarts.init(statusChartEl.value)
+    statusChart.setOption(buildStatusOption())
+  }
+  if (shopChartEl.value) {
+    shopChart = echarts.init(shopChartEl.value)
+    shopChart.setOption(buildShopOption())
+  }
+  if (priorityChartEl.value) {
+    priorityChart = echarts.init(priorityChartEl.value)
+    priorityChart.setOption(buildPriorityOption())
+  }
+  window.addEventListener('resize', onResize)
 })
 
 onUnmounted(() => {
-  window.removeEventListener('resize', resizeChart)
+  // 移除监听 + 销毁全部实例，避免内存泄漏
+  window.removeEventListener('resize', onResize)
   chart?.dispose()
+  statusChart?.dispose()
+  shopChart?.dispose()
+  priorityChart?.dispose()
   chart = null
+  statusChart = null
+  shopChart = null
+  priorityChart = null
 })
 </script>
 
@@ -261,10 +397,24 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- 第五块：ECharts 设备类型分布环形图(文档 P13 任务 ③) -->
-    <div class="chart-card">
-      <h3 class="chart-title">设备类型分布</h3>
-      <div ref="chartEl" class="chart-container"></div>
+    <!-- 第五块：图表与分析区 —— 设备类型 / 状态 / 车间 / 优先级 四张图 2×2 排布 -->
+    <div class="analysis-grid">
+      <div class="chart-card">
+        <h3 class="chart-title">设备类型分布</h3>
+        <div ref="chartEl" class="analysis-chart"></div>
+      </div>
+      <div class="chart-card">
+        <h3 class="chart-title">设备状态分布</h3>
+        <div ref="statusChartEl" class="analysis-chart"></div>
+      </div>
+      <div class="chart-card">
+        <h3 class="chart-title">各车间设备数量</h3>
+        <div ref="shopChartEl" class="analysis-chart"></div>
+      </div>
+      <div class="chart-card">
+        <h3 class="chart-title">工单优先级分布</h3>
+        <div ref="priorityChartEl" class="analysis-chart"></div>
+      </div>
     </div>
   </section>
 </template>
@@ -475,12 +625,12 @@ onUnmounted(() => {
   font-size: 13px;
 }
 
-/* 第五块：ECharts 环形图卡片 */
+/* 图表卡片：白底圆角、轻微阴影 */
 .chart-card {
   background: #fff;
   border-radius: 12px;
   padding: 20px;
-  box-shadow: 0 2px 8px rgba(16, 48, 95, 0.05);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
 }
 .chart-title {
   font-size: 15px;
@@ -488,9 +638,23 @@ onUnmounted(() => {
   margin: 0 0 12px;
   color: var(--text-main);
 }
-.chart-container {
+
+/* 第五块：四张分析图 2×2 排布（宽屏两列，窄屏单列堆叠） */
+.analysis-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 16px;
+}
+
+.analysis-chart {
   width: 100%;
-  height: 320px;
+  height: 360px;
+}
+
+@media (max-width: 1080px) {
+  .analysis-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* 手机端：卡片两列、信息列表单列 */
@@ -504,7 +668,7 @@ onUnmounted(() => {
   .stats {
     grid-template-columns: 1fr;
   }
-  .chart-container {
+  .analysis-chart {
     height: 280px;
   }
 }
