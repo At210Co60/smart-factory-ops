@@ -8,6 +8,7 @@ import {
   type Device,
   type WorkOrder,
 } from '@/mock/data'
+import { nowStr } from '@/utils/format'
 
 const route = useRoute()
 const router = useRouter()
@@ -86,7 +87,10 @@ const priorityOptions: Array<{ key: WorkOrder['priority']; label: string; color:
 /* ============= 提交 ============= */
 function generateOrderNo(): string {
   const d = new Date()
-  const date = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`
+  // 年份取后两位:和种子工单(WO-261013001)保持同一种格式,
+  // 否则待处理页签里会混着 WO-2026... 和 WO-26... 两种编号
+  const yy = String(d.getFullYear()).slice(-2)
+  const date = `${yy}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`
   const prefix = `WO-${date}`
   const orders = loadOrders()
   let maxSeq = 0
@@ -100,9 +104,18 @@ function generateOrderNo(): string {
   return `${prefix}${seq}`
 }
 
-function nowStr(): string {
-  const d = new Date()
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+// 当前登录账号(操作日志的"操作人")
+function currentUser(): string {
+  try {
+    const auth = localStorage.getItem('fop_auth_v1')
+    if (auth) {
+      const u = JSON.parse(auth).user
+      if (u) return String(u)
+    }
+  } catch {
+    // 读不到就用默认名
+  }
+  return '系统管理员'
 }
 
 function submit() {
@@ -118,15 +131,27 @@ function submit() {
   }
   if (!selectedDevice.value || desc.value.trim().length < 5) return
 
+  const desc0 = desc.value.trim()
+  const time = nowStr()
   const newOrder: WorkOrder = {
     no: generateOrderNo(),
     deviceId: selectedDevice.value.id,
     deviceName: selectedDevice.value.name,
-    desc: desc.value.trim(),
+    desc: desc0,
     priority: priority.value,
     status: 'pending',
-    createTime: nowStr(),
+    createTime: time,
     finishTime: '',
+    // 第一条操作日志:这单是谁、什么时候登记的
+    opLog: [
+      {
+        status: 'pending',
+        label: '创建工单',
+        time,
+        operator: currentUser(),
+        note: `登记故障：${desc0}`,
+      },
+    ],
   }
 
   // 插到列表最前面

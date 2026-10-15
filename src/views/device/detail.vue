@@ -2,6 +2,8 @@
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { DEVICES, DEVICE_STATUS, type Device } from '@/mock/data'
+import { latestMaintenanceOf } from '@/mock/plans'
+import { sparesForDeviceType, spareStatus, SPARE_STATUS_META, type SparePart } from '@/mock/spares'
 
 const route = useRoute()
 const router = useRouter()
@@ -13,6 +15,30 @@ const deviceId = computed(() => String(route.params.id || ''))
 const device = computed<Device | undefined>(() =>
   DEVICES.find((d) => d.id === deviceId.value),
 )
+
+// 最近保养日期:维护计划里记录了"哪天做完的"就用它,没有则回落到台账自带的值。
+// 这样在维护计划页点过"完成本次"之后,这里会跟着更新,两个模块的数据是通的。
+const lastMaintDate = computed(() => {
+  if (!device.value) return ''
+  return latestMaintenanceOf(device.value.id) || device.value.lastMaint
+})
+
+// 该设备用得到的备件(按设备类型反查备件库):缺货/低库存直接标出来
+const relatedSpares = computed<SparePart[]>(() =>
+  device.value ? sparesForDeviceType(device.value.type) : [],
+)
+// 有几样是缺货或低库存的,用来决定卡片上是否给警示
+const shortageCount = computed(() =>
+  relatedSpares.value.filter((s) => spareStatus(s) !== 'ok').length,
+)
+
+function spareMeta(s: SparePart) {
+  return SPARE_STATUS_META[spareStatus(s)]
+}
+
+function goSpareList() {
+  router.push('/spare/list')
+}
 
 function statusLabel(s: Device['status']) {
   return DEVICE_STATUS[s]?.label || '—'
@@ -173,7 +199,7 @@ function goCreateOrder() {
           </div>
           <div class="info-item">
             <span class="info-label">最近保养</span>
-            <span class="info-value">{{ device.lastMaint }}</span>
+            <span class="info-value">{{ lastMaintDate }}</span>
           </div>
         </div>
       </div>
@@ -197,6 +223,38 @@ function goCreateOrder() {
         <button class="btn primary full" @click="goCreateOrder">
           为此设备创建工单
         </button>
+      </div>
+    </div>
+
+    <!-- 关联备件:按设备类型反查备件库,缺件的话在这一步就能发现,不用等派工才抓瞎 -->
+    <div v-if="relatedSpares.length" class="card spare-card">
+      <div class="spare-head">
+        <h3 class="card-title no-border">
+          关联备件
+          <span class="spare-sub">该机型常用备件 {{ relatedSpares.length }} 种</span>
+        </h3>
+        <div class="spare-head-right">
+          <span v-if="shortageCount" class="shortage-tip">{{ shortageCount }} 种缺货或低库存</span>
+          <button class="link-more" @click="goSpareList">去备件库存 →</button>
+        </div>
+      </div>
+      <div class="spare-grid">
+        <div v-for="s in relatedSpares" :key="s.code" class="spare-item">
+          <div class="spare-item-head">
+            <span class="spare-name">{{ s.name }}</span>
+            <span class="tag small" :class="`tag-${spareMeta(s).color}`">{{ spareMeta(s).label }}</span>
+          </div>
+          <div class="spare-item-body">
+            <span class="spare-code mono">{{ s.code }}</span>
+            <span class="spare-qty" :class="{ low: spareStatus(s) !== 'ok' }">
+              {{ s.qty }} {{ s.unit }}
+            </span>
+          </div>
+          <div class="spare-item-foot">
+            <span class="spare-spec">{{ s.spec || '—' }}</span>
+            <span class="spare-loc">{{ s.location || '库位未登记' }}</span>
+          </div>
+        </div>
       </div>
     </div>
   </section>
@@ -353,6 +411,109 @@ function goCreateOrder() {
   margin: 0;
 }
 
+/* 关联备件卡片 */
+.spare-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.spare-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.spare-head .card-title {
+  margin: 0;
+  padding: 0;
+  border-bottom: none;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.spare-sub {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-sub);
+}
+.spare-head-right {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.shortage-tip {
+  font-size: 12px;
+  color: #f08c2e;
+}
+.link-more {
+  border: none;
+  background: transparent;
+  color: var(--primary);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 0;
+}
+.link-more:hover { text-decoration: underline; }
+
+.spare-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+.spare-item {
+  border: 1px solid #eef2f8;
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+.spare-item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.spare-name {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-main);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.spare-item-body {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.spare-code { font-size: 12px; color: var(--text-sub); }
+.mono { font-family: ui-monospace, monospace; }
+.spare-qty {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-main);
+}
+.spare-qty.low { color: #e5454b; }
+.spare-item-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-sub);
+}
+.spare-spec,
+.spare-loc {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* 状态/类型标签 */
 .tag {
   display: inline-block;
@@ -360,6 +521,7 @@ function goCreateOrder() {
   border-radius: 12px;
   font-size: 12px;
   color: #fff;
+  white-space: nowrap;
 }
 .tag.small { padding: 1px 8px; font-size: 11px; }
 .tag-green  { background: #2bbf6a; }

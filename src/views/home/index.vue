@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
-import * as echarts from 'echarts'
+import { ref, computed, onMounted, watch } from 'vue'
 import request from '@/api'
-import { DEVICES, DEVICE_STATUS, PRIORITY, loadOrders } from '@/mock/data'
+import { DEVICES, DEVICE_STATUS, PRIORITY, loadOrders, type WorkOrder } from '@/mock/data'
 import { countBy } from '@/utils/stats'
+import { mountCharts } from '@/utils/charts'
+import { dateOf } from '@/utils/format'
 
 // localStorage 键名：记住用户上次查的城市，刷新/重开浏览器都保留
 const CITY_KEY = 'fop_weather_city_v1'
@@ -32,21 +33,114 @@ watch(city, (val) => {
 const loading = ref(false)
 const errorMsg = ref('')
 const weather = ref<any>(null)
+// 当前展示的是不是离线演示数据(没配 key / 请求失败时兜底用)
+const isFallback = ref(false)
+// 请求序号:用户连续切城市时,只让最后一次请求的结果/状态生效
+let loadSeq = 0
 
-// 指标卡片数据(文档第 9 节任务 ②)：设备总数(死台账)+ 待处理工单数(活数据,从 localStorage 取)
+/* ============= 离线演示数据 =============
+ * 演示场景兜底:没有 VITE_TIANAPI_KEY 或请求失败时,用确定性算法生成一份天气数据,
+ * 保证看板在任何环境下都能完整展示,不会出现红色报错。
+ * 入参 city 参与 hash,同一城市每次生成的天气一致;日期/星期跟随当天。
+ */
+function hashCode(s: string): number {
+  let h = 0
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) - h + s.charCodeAt(i)) | 0
+  }
+  return Math.abs(h)
+}
+
+// 各种天气对应的气温区间 / 湿度 / 空气质量,让生成的数据看起来像真的
+const WEATHER_POOL = [
+  { weather: '晴',       temps: [18, 30], humidity: [35, 60], quality: '优',    aqi: [20, 45] },
+  { weather: '多云',     temps: [16, 27], humidity: [45, 70], quality: '良',    aqi: [50, 90] },
+  { weather: '阴',       temps: [14, 24], humidity: [55, 80], quality: '良',    aqi: [55, 95] },
+  { weather: '小雨',     temps: [12, 21], humidity: [70, 92], quality: '优',    aqi: [25, 50] },
+  { weather: '雷阵雨',   temps: [15, 26], humidity: [65, 90], quality: '良',    aqi: [45, 85] },
+  { weather: '晴转多云', temps: [17, 28], humidity: [40, 65], quality: '优',    aqi: [30, 55] },
+  { weather: '多云转晴', temps: [16, 29], humidity: [40, 68], quality: '良',    aqi: [50, 80] },
+]
+
+const WIND_DIRS = ['东北风', '东风', '东南风', '南风', '西南风', '西风', '西北风', '北风']
+const WEEK_LABEL = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六']
+
+// 用「种子 + 序号」再 hash 一次取区间内整数。
+// 直接对种子做位运算会有两个坑:短城市名的种子右移后容易变 0(hash 全塌成同一个值),
+// 相邻数据之间也容易撞车;先二次 hash 就稳定了。
+function pickInRange(seed: number, salt: number, min: number, max: number): number {
+  return min + (hashCode(String(seed) + '_' + salt) % (max - min + 1))
+}
+
+function buildDemoWeather(city: string) {
+  const seed = hashCode(city)
+  const w = WEATHER_POOL[seed % WEATHER_POOL.length]
+  const real = pickInRange(seed, 1, w.temps[0], w.temps[1])
+  const humidity = pickInRange(seed, 2, w.humidity[0], w.humidity[1])
+  const windSc = pickInRange(seed, 3, 2, 5)
+
+  // 日期 / 星期跟随当天,用本地时间
+  const today = new Date()
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const dateStr = `${today.getFullYear()}-${pad(today.getMonth() + 1)}-${pad(today.getDate())}`
+
+  return {
+    area: city,
+    date: dateStr,
+    week: WEEK_LABEL[today.getDay()],
+    weather: w.weather,
+    real: String(real),
+    highest: String(real + pickInRange(seed, 4, 3, 6)),
+    lowest: String(real - pickInRange(seed, 5, 5, 9)),
+    humidity: String(humidity),
+    wind: WIND_DIRS[seed % WIND_DIRS.length],
+    windsc: `${windSc}级`,
+    quality: w.quality,
+    aqi: String(pickInRange(seed, 6, w.aqi[0], w.aqi[1])),
+    tips: `今日${w.weather},气温 ${real}℃ 左右,${w.weather.includes('雨') ? '外出请携带雨具,注意防滑' : '适宜进行户外活动,注意适时补水'}。当前 ${pad(today.getHours())}:${pad(today.getMinutes())}`,
+  }
+}
+
+/* ============= 指标卡数据 =============
+ * 设备总数来自死台账,pending/完成率来自活数据(loadOrders)。
+ * 除了"有多少",再给两个比率(设备运行率、工单完成率)——
+ * 这是判断"这个厂现在状况如何"最直接的两个数,比单看总数更有信息量。
+ */
 const deviceTotal = DEVICES.length
-const pendingOrderCount = ref(0)
-function refreshPendingCount() {
-  const orders = loadOrders()
-  pendingOrderCount.value = orders.filter((o) => o.status === 'pending').length
+const ordersRef = ref<WorkOrder[]>(loadOrders())
+
+const pendingOrderCount = computed(() => ordersRef.value.filter((o) => o.status === 'pending').length)
+const doneOrderCount = computed(() => ordersRef.value.filter((o) => o.status === 'done').length)
+const runningCount = computed(() => DEVICES.filter((d) => d.status === 'running').length)
+const runningRate = computed(() =>
+  deviceTotal ? Math.round((runningCount.value / deviceTotal) * 100) : 0,
+)
+const doneRate = computed(() =>
+  ordersRef.value.length ? Math.round((doneOrderCount.value / ordersRef.value.length) * 100) : 0,
+)
+
+// 工单页流转/新建后回到看板,重新拉一次让数字跟着更新
+function refreshOrderStats() {
+  ordersRef.value = loadOrders()
 }
 
 // 天行接口：/tianqi/index；type=1 实时天气 / type=7 七天
 // 用封装好的 request:自动补 key、自动判 code(非 200 进 catch)、相同请求会自动取消上一次的
 async function loadData() {
+  // 请求序号:每次调用自增,只有最后一次请求有资格收尾(关 loading / 兜底数据)
+  const seq = ++loadSeq
   loading.value = true
   errorMsg.value = ''
+  isFallback.value = false
   try {
+    // 先看有没有可用的 key:没配(或还是模板占位符)就不发请求,直接走离线演示数据,
+    // 避免控制台出现 240 报错、页面出现红色错误块
+    const apiKey = import.meta.env.VITE_TIANAPI_KEY
+    if (!apiKey || apiKey === 'your_key_here') {
+      weather.value = buildDemoWeather(city.value)
+      isFallback.value = true
+      return
+    }
     // 注意:key 不用传,拦截器自动注入
     const res = await request.get('/tianapi/tianqi/index', {
       params: { city: city.value, type: 1 },
@@ -54,17 +148,27 @@ async function loadData() {
     // 拦截器已经把 code !== 200 的情况转成 reject,所以这里直接取数据
     weather.value = res.data.result
   } catch (e: any) {
-    // 被静默取消的请求(用户连续切城市时)不报错
+    // 被静默取消的请求(用户连续切城市时):不报错,交给后一次请求收尾
     if (e?.silent) return
-    errorMsg.value = (e as Error).message || '请求失败'
+    // 上次请求失败/取消的兜底数据不能盖住新请求的结果
+    if (seq !== loadSeq) return
+    // 请求失败也兜底成离线演示数据:看板始终有内容可展示/可讲
+    weather.value = buildDemoWeather(city.value)
+    isFallback.value = true
+    // 只在"网络层失败"时把原因透出来。天行的业务错误(如 key 无效/额度用完)走的是
+    // 响应拦截器抛的普通 Error,带数字 code 但没有 response——这类不吓唬演示者,
+    // 顶部提示条上"未配置或接口不可用"已经说清楚了
+    if (!e?.response && typeof e?.code !== 'number') {
+      errorMsg.value = (e as Error).message || '请求失败'
+    }
   } finally {
-    loading.value = false
+    // 只有最后一次请求能关 loading,否则会先闪一下"暂无数据"
+    if (seq === loadSeq) loading.value = false
   }
 }
 
 /* ============= ECharts 设备类型分布环形图 ============= */
 const chartEl = ref<HTMLDivElement | null>(null)
-let chart: echarts.ECharts | null = null
 
 // 颜色:跟状态标签色调统一,视觉不跳脱
 const TYPE_COLORS: Record<string, string> = {
@@ -145,8 +249,6 @@ const shopData = computed(() => countBy(DEVICES, (d) => d.shop))
 
 const statusChartEl = ref<HTMLDivElement | null>(null)
 const shopChartEl = ref<HTMLDivElement | null>(null)
-let statusChart: echarts.ECharts | null = null
-let shopChart: echarts.ECharts | null = null
 
 // 状态配色和状态标签保持一致，视觉不跳脱
 const STATUS_COLORS: Record<string, string> = {
@@ -154,6 +256,87 @@ const STATUS_COLORS: Record<string, string> = {
   '故障': '#d93939',
   '停机': '#8a93ab',
   '维护中': '#f08c2e',
+}
+
+/* ============= 近 14 天工单趋势 + 故障工单排行 =============
+ * 这两块原来是独立的「数据分析」页,但它和设备类型/状态/车间三张图功能重叠,
+ * 而且多一个"看起来也是仪表盘"的页面并不加分。所以去掉那个页面,
+ * 只把它独有的"时间维度"和"故障排行"并进看板 —— 页面少一个,洞察一个不少。
+ */
+
+// 近 14 天每日创建量:按 createTime 的日期分组
+const trendData = computed(() => {
+  const days: string[] = []
+  for (let i = 13; i >= 0; i--) {
+    const d = new Date()
+    d.setDate(d.getDate() - i)
+    const pad = (n: number) => String(n).padStart(2, '0')
+    days.push(`${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`)
+  }
+  const counts = countBy(ordersRef.value, (o) => dateOf(o.createTime))
+  return days.map((day) => ({
+    day: day.slice(5), // 只留 MM-DD,横轴更清爽
+    count: counts.find((c) => c.name === day)?.value ?? 0,
+  }))
+})
+
+// 故障工单排行:按设备聚合工单数,取前 8
+const faultRanking = computed(() => {
+  const map = new Map<string, { id: string; name: string; count: number; latest: string }>()
+  ordersRef.value.forEach((o) => {
+    const cur = map.get(o.deviceId)
+    if (cur) {
+      cur.count += 1
+      if (o.createTime > cur.latest) cur.latest = o.createTime
+    } else {
+      map.set(o.deviceId, { id: o.deviceId, name: o.deviceName, count: 1, latest: o.createTime })
+    }
+  })
+  return [...map.values()]
+    .sort((a, b) => b.count - a.count || (a.latest < b.latest ? 1 : -1))
+    .slice(0, 8)
+})
+const maxFaultCount = computed(() => faultRanking.value[0]?.count || 1)
+
+// 排行里那台设备现在是什么状态(还坏着还是已恢复),给个小色点
+function deviceStatusOf(id: string) {
+  const d = DEVICES.find((x) => x.id === id)
+  return d ? DEVICE_STATUS[d.status] : { label: '—', color: 'gray' }
+}
+
+const trendChartEl = ref<HTMLDivElement | null>(null)
+
+function buildTrendOption() {
+  return {
+    tooltip: { trigger: 'axis' },
+    grid: { left: 48, right: 24, top: 28, bottom: 36 },
+    xAxis: {
+      type: 'category',
+      boundaryGap: false,
+      data: trendData.value.map((t) => t.day),
+    },
+    yAxis: { type: 'value', name: '单量', minInterval: 1 },
+    series: [
+      {
+        type: 'line',
+        smooth: true,
+        symbolSize: 7,
+        data: trendData.value.map((t) => t.count),
+        itemStyle: { color: '#1e6fd9' },
+        lineStyle: { width: 3 },
+        areaStyle: {
+          color: {
+            type: 'linear',
+            x: 0, y: 0, x2: 0, y2: 1,
+            colorStops: [
+              { offset: 0, color: 'rgba(30, 111, 217, 0.28)' },
+              { offset: 1, color: 'rgba(30, 111, 217, 0.02)' },
+            ],
+          },
+        },
+      },
+    ],
+  }
 }
 
 /* ============= 工单优先级分布柱状图 ============= */
@@ -169,7 +352,6 @@ const priorityData = computed(() => {
 })
 
 const priorityChartEl = ref<HTMLDivElement | null>(null)
-let priorityChart: echarts.ECharts | null = null
 
 // 优先级配色：红(高) / 橙(中) / 绿(低)，跟 PRIORITY.color 视觉统一
 const PRIORITY_COLORS: Record<string, string> = {
@@ -248,49 +430,19 @@ function buildPriorityOption() {
   }
 }
 
-// 窗口变化时四个图表都重绘（具名函数，才能被 removeEventListener 删掉）
-function onResize() {
-  chart?.resize()
-  statusChart?.resize()
-  shopChart?.resize()
-  priorityChart?.resize()
-}
-
 onMounted(() => {
   loadData()
-  refreshPendingCount()
+  refreshOrderStats()
 
-  // 初始化图表：init 必须在 onMounted 里，DOM 渲染完才能拿到容器
-  if (chartEl.value) {
-    chart = echarts.init(chartEl.value)
-    chart.setOption(buildChartOption())
-  }
-  if (statusChartEl.value) {
-    statusChart = echarts.init(statusChartEl.value)
-    statusChart.setOption(buildStatusOption())
-  }
-  if (shopChartEl.value) {
-    shopChart = echarts.init(shopChartEl.value)
-    shopChart.setOption(buildShopOption())
-  }
-  if (priorityChartEl.value) {
-    priorityChart = echarts.init(priorityChartEl.value)
-    priorityChart.setOption(buildPriorityOption())
-  }
-  window.addEventListener('resize', onResize)
-})
-
-onUnmounted(() => {
-  // 移除监听 + 销毁全部实例，避免内存泄漏
-  window.removeEventListener('resize', onResize)
-  chart?.dispose()
-  statusChart?.dispose()
-  shopChart?.dispose()
-  priorityChart?.dispose()
-  chart = null
-  statusChart = null
-  shopChart = null
-  priorityChart = null
+  // 五张图的 init / resize / dispose 统一交给 mountCharts(见 utils/charts.ts),
+  // 初始化必须在 onMounted 里,DOM 渲染完才能拿到容器
+  mountCharts([
+    { ref: chartEl, option: buildChartOption() },
+    { ref: statusChartEl, option: buildStatusOption() },
+    { ref: shopChartEl, option: buildShopOption() },
+    { ref: priorityChartEl, option: buildPriorityOption() },
+    { ref: trendChartEl, option: buildTrendOption() },
+  ])
 })
 </script>
 
@@ -314,14 +466,23 @@ onUnmounted(() => {
     <!-- 状态 1：加载中 -->
     <p v-if="loading" class="status">加载中……</p>
 
-    <!-- 状态 2：请求失败（中文错误 + 重新加载按钮） -->
-    <div v-else-if="errorMsg" class="status error">
+    <!-- 请求彻底失败、且没有任何数据可展示时才占满整块 -->
+    <div v-if="errorMsg && !weather" class="status error">
       <p>{{ errorMsg }}</p>
       <button @click="loadData">重新加载</button>
     </div>
 
-    <!-- 状态 3：拿到结果才渲染。v-else-if 用 weather 兜底，避免 null 时崩 -->
-    <template v-else-if="weather">
+    <!-- 离线演示数据提示:内容照常展示,只在顶部加一条说明,避免误会成实时数据 -->
+    <div v-if="isFallback && weather" class="fallback-notice">
+      <span class="fallback-tag">离线演示</span>
+      <span class="fallback-text">
+        当前为内置演示数据（未配置天气 API key 或接口不可用），看板其余模块均为真实业务数据
+        <template v-if="errorMsg">；接口错误：{{ errorMsg }}</template>
+      </span>
+    </div>
+
+    <!-- 拿到结果才渲染。v-else 兜底，避免 null 时崩 -->
+    <template v-if="weather">
       <!-- 第一行：四张数据卡片 -->
       <div class="cards">
         <div class="card">
@@ -380,20 +541,25 @@ onUnmounted(() => {
       </div>
     </template>
 
-    <!-- 兜底空状态 -->
-    <p v-else class="status">暂无数据</p>
+    <!-- 兜底空状态：不在加载中、也没有错误提示时才显示 -->
+    <p v-if="!weather && !loading && !errorMsg" class="status">暂无数据</p>
 
-    <!-- 第四块：指标卡片(设备总数 / 待处理工单数)。独立显示,不受天气状态影响 -->
+    <!-- 指标卡片:设备运行率 / 待处理工单 / 工单完成率。比率比单看总数更能说明现状 -->
     <div class="stats">
       <div class="stat-card">
-        <span class="stat-label">设备总数</span>
-        <span class="stat-value">{{ deviceTotal }}</span>
-        <span class="stat-unit">台</span>
+        <span class="stat-label">设备运行率</span>
+        <span class="stat-value">{{ runningRate }}<em>%</em></span>
+        <span class="stat-unit">{{ runningCount }} / {{ deviceTotal }} 台运行中</span>
       </div>
       <div class="stat-card">
         <span class="stat-label">待处理工单</span>
-        <span class="stat-value pending">{{ pendingOrderCount }}</span>
-        <span class="stat-unit">单</span>
+        <span class="stat-value pending">{{ pendingOrderCount }}<em>单</em></span>
+        <span class="stat-unit">需尽快派工</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">工单完成率</span>
+        <span class="stat-value good">{{ doneRate }}<em>%</em></span>
+        <span class="stat-unit">{{ doneOrderCount }} / {{ ordersRef.length }} 单已完成</span>
       </div>
     </div>
 
@@ -414,6 +580,50 @@ onUnmounted(() => {
       <div class="chart-card">
         <h3 class="chart-title">工单优先级分布</h3>
         <div ref="priorityChartEl" class="analysis-chart"></div>
+      </div>
+    </div>
+
+    <!-- 第六块：运维洞察 —— 左边看"工单量怎么走"，右边看"谁最该管" -->
+    <h3 class="section-title">运维洞察</h3>
+    <div class="insight-grid">
+      <div class="chart-card">
+        <h3 class="chart-title">
+          近 14 天工单创建趋势
+          <span class="chart-sub">按工单创建日期统计</span>
+        </h3>
+        <div ref="trendChartEl" class="analysis-chart"></div>
+      </div>
+
+      <div class="rank-card">
+        <h3 class="chart-title">
+          故障工单排行
+          <span class="chart-sub">数量越多越该关注</span>
+        </h3>
+        <ul v-if="faultRanking.length" class="rank-list">
+          <li v-for="(item, i) in faultRanking" :key="item.id" class="rank-item">
+            <span class="rank-no" :class="{ top: i < 3 }">{{ i + 1 }}</span>
+            <div class="rank-main">
+              <div class="rank-line">
+                <span class="rank-name">{{ item.name }}</span>
+                <span class="rank-count">{{ item.count }} 单</span>
+              </div>
+              <div class="rank-bar">
+                <span
+                  class="rank-bar-inner"
+                  :style="{ width: (item.count / maxFaultCount) * 100 + '%' }"
+                ></span>
+              </div>
+              <div class="rank-meta">
+                <span class="mono">{{ item.id }}</span>
+                <span class="tag small" :class="`tag-${deviceStatusOf(item.id).color}`">
+                  {{ deviceStatusOf(item.id).label }}
+                </span>
+                <span class="rank-time">最近 {{ item.latest }}</span>
+              </div>
+            </div>
+          </li>
+        </ul>
+        <p v-else class="rank-empty">暂无工单数据</p>
       </div>
     </div>
   </section>
@@ -506,6 +716,32 @@ onUnmounted(() => {
   font-size: 13px;
 }
 
+/* 离线演示数据提示条：用琥珀色而非红色，表示"降级但仍可用"，不是报错 */
+.fallback-notice {
+  background: #fff8ec;
+  border: 1px solid #f5d9ab;
+  border-left: 4px solid #f08c2e;
+  border-radius: 12px;
+  padding: 10px 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.fallback-tag {
+  flex-shrink: 0;
+  background: #f08c2e;
+  color: #fff;
+  border-radius: 10px;
+  padding: 2px 10px;
+  font-size: 12px;
+}
+
+.fallback-text {
+  color: #8a5b1a;
+}
+
 /* 第一行：四张卡片 */
 .cards {
   display: grid;
@@ -594,7 +830,7 @@ onUnmounted(() => {
 /* 第四块：指标卡片 */
 .stats {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
 }
 .stat-card {
@@ -602,27 +838,38 @@ onUnmounted(() => {
   border-radius: 12px;
   padding: 20px 24px;
   display: flex;
-  align-items: baseline;
-  gap: 8px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
   box-shadow: 0 2px 8px rgba(16, 48, 95, 0.05);
+  min-width: 0;
 }
 .stat-label {
   color: var(--text-sub);
   font-size: 14px;
-  margin-right: auto;
 }
 .stat-value {
   color: var(--text-main);
   font-size: 28px;
   font-weight: 600;
-  line-height: 1;
+  line-height: 1.15;
+}
+.stat-value em {
+  font-style: normal;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-sub);
+  margin-left: 2px;
 }
 .stat-value.pending {
   color: #f08c2e;
 }
+.stat-value.good {
+  color: #2bbf6a;
+}
 .stat-unit {
   color: var(--text-sub);
-  font-size: 13px;
+  font-size: 12px;
 }
 
 /* 图表卡片：白底圆角、轻微阴影 */
@@ -637,7 +884,140 @@ onUnmounted(() => {
   font-weight: 600;
   margin: 0 0 12px;
   color: var(--text-main);
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
 }
+/* 图表标题后面的小字说明,避免看板上的数字没有口径 */
+.chart-sub {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-sub);
+}
+
+/* 第六块：运维洞察(趋势 + 故障排行) */
+.section-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 4px 0 0;
+  color: var(--text-main);
+  padding-left: 10px;
+  border-left: 3px solid var(--primary);
+  line-height: 1.2;
+}
+.insight-grid {
+  display: grid;
+  grid-template-columns: 3fr 2fr;
+  gap: 16px;
+}
+.rank-card {
+  background: #fff;
+  border-radius: 12px;
+  padding: 20px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+  min-width: 0;
+}
+.rank-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.rank-item {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  min-width: 0;
+}
+.rank-no {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #f0f4fa;
+  color: var(--text-sub);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 2px;
+}
+.rank-no.top {
+  background: var(--primary);
+  color: #fff;
+}
+.rank-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.rank-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.rank-name {
+  font-size: 13px;
+  color: var(--text-main);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rank-count {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-main);
+  flex-shrink: 0;
+}
+.rank-bar {
+  height: 6px;
+  background: #f0f4fa;
+  border-radius: 3px;
+  overflow: hidden;
+}
+.rank-bar-inner {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #5b9bee, #1e6fd9);
+  border-radius: 3px;
+}
+.rank-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-sub);
+}
+.mono { font-family: ui-monospace, monospace; }
+.rank-time { margin-left: auto; }
+.rank-empty {
+  font-size: 13px;
+  color: var(--text-sub);
+  margin: 0;
+}
+
+/* 状态/优先级标签(排行用的小号标签) */
+.tag {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  color: #fff;
+  white-space: nowrap;
+}
+.tag.small { padding: 0 7px; font-size: 11px; line-height: 16px; }
+.tag-green  { background: #2bbf6a; }
+.tag-red    { background: #e5454b; }
+.tag-gray   { background: #8a93a6; }
+.tag-orange { background: #f08c2e; }
+.tag-blue   { background: #2e7be2; }
 
 /* 第五块：四张分析图 2×2 排布（宽屏两列，窄屏单列堆叠） */
 .analysis-grid {
@@ -655,6 +1035,9 @@ onUnmounted(() => {
   .analysis-grid {
     grid-template-columns: 1fr;
   }
+  .insight-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* 手机端：卡片两列、信息列表单列 */
@@ -670,6 +1053,16 @@ onUnmounted(() => {
   }
   .analysis-chart {
     height: 280px;
+  }
+  .rank-card {
+    padding: 14px;
+  }
+  .rank-meta {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .rank-time {
+    margin-left: 0;
   }
 }
 </style>

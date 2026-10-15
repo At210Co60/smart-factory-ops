@@ -16,6 +16,14 @@
 
 import axios, { type AxiosResponse, type InternalAxiosRequestConfig } from 'axios'
 
+// 给 axios 的 config 挂一个自定义字段:记录"这次请求自己的" AbortController,
+// 后续响应/取消回调靠它做身份比对,避免误删同 key 新请求的 controller
+declare module 'axios' {
+  interface InternalAxiosRequestConfig {
+    _controller?: AbortController
+  }
+}
+
 // ===== 实例:统一 baseURL / 超时 =====
 const request = axios.create({
   timeout: 15000,
@@ -27,15 +35,31 @@ const pendingControllers = new Map<string, AbortController>()
 
 function getRequestKey(config: InternalAxiosRequestConfig): string {
   const method = (config.method || 'get').toUpperCase()
-  // 不带 params(避免重复请求但参数不同被误杀)
+  // 只用 method + url,不带 params(避免"同一个接口换参数"被当成两个不同请求)
   return `${method}_${config.url || ''}`
 }
 
-/** 把 pendingControllers 里属于这次请求的 controller 取消并删除 */
-function abortAndDelete(key: string) {
+/** 取消并移除 map 里当前的 controller(发起新请求时用,语义就是"把上次的顶掉") */
+function abortPending(key: string) {
   const c = pendingControllers.get(key)
   if (c) {
     c.abort()
+    pendingControllers.delete(key)
+  }
+}
+
+/**
+ * 从 map 里摘掉"这次请求自己的" controller。
+ *
+ * 关键:不能无条件按 key 删。同 key 的新请求 B 发出时会覆盖 map 里的 controller,
+ * 此时旧请求 A 的响应/取消回调如果还按 key 删,删掉的就是 B 的 —— B 从此不可取消,
+ * 而且下一次请求的 abort 会落空(表现为:连按两次回车切城市,后一次请求被静默取消,
+ * 看板留着旧城市数据且不报错)。
+ * 所以拿 config 上挂着的那一个来比对身份,只删自己。
+ */
+function releaseController(config: InternalAxiosRequestConfig) {
+  const key = getRequestKey(config)
+  if (pendingControllers.get(key) === config._controller) {
     pendingControllers.delete(key)
   }
 }
@@ -44,10 +68,12 @@ function abortAndDelete(key: string) {
 request.interceptors.request.use((config) => {
   const key = getRequestKey(config)
   // 取消上一次的相同请求,避免快速切换时数据错乱
-  abortAndDelete(key)
-  // 创建本次请求的 controller 并挂上 signal
+  abortPending(key)
+  // 创建本次请求的 controller,同时挂到 config.signal 和 config._controller:
+  // signal 给 axios 用,_controller 留着自己做身份比对
   const controller = new AbortController()
   config.signal = controller.signal
+  config._controller = controller
   pendingControllers.set(key, controller)
 
   // 自动补 key:params 里没有 key 时注入
@@ -76,9 +102,8 @@ request.interceptors.request.use((config) => {
 // ===== 响应拦截器 =====
 request.interceptors.response.use(
   (response: AxiosResponse) => {
-    // 请求完成,从 pending 里删除
-    const key = getRequestKey(response.config)
-    abortAndDelete(key)
+    // 请求完成:只摘掉自己那个 controller(不能按 key 无脑删,可能已经是新请求的了)
+    releaseController(response.config)
 
     const data: any = response.data
     // 天行接口约定:HTTP 永远是 200,业务状态码在 data.code
@@ -92,10 +117,9 @@ request.interceptors.response.use(
     return response
   },
   (error) => {
-    // pending 里也得清掉
+    // 失败/取消同样只摘掉自己那个,否则会误删同 key 新请求的 controller
     if (error?.config) {
-      const key = getRequestKey(error.config)
-      abortAndDelete(key)
+      releaseController(error.config)
     }
     // 用户主动取消(AbortController.abort)不算错,转成静默 reject
     if (axios.isCancel(error)) {

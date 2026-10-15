@@ -3,7 +3,7 @@ import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   loadOrders,
-  saveOrders,
+  transitionOrder,
   PRIORITY,
   type WorkOrder,
 } from '@/mock/data'
@@ -67,13 +67,31 @@ function nextPage() { if (pageNo.value < totalPages.value) pageNo.value++ }
 const timeHeader = computed(() => (activeTab.value === 'done' ? '完成时间' : '创建时间'))
 
 /* ============= 状态流转 ============= */
-function nowStr(): string {
-  const d = new Date()
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+/* 流转统一走 data.ts 的 transitionOrder:改状态 + 写操作日志 + 持久化一步到位,
+   这样工单详情页的时间轴才能看到"谁在什么时候动的这一单" */
+
+// 「开始处理」:pending → processing
+function startProcess(o: WorkOrder) {
+  openConfirm('开始处理工单', `确认将工单 ${o.no} 设为处理中状态?`, () => {
+    orderList.value = transitionOrder(orderList.value, o.no, 'processing')
+  })
 }
 
-function persist() {
-  saveOrders(orderList.value)
+// 「完成」:processing → done,写入完成时间
+function completeOrder(o: WorkOrder) {
+  openConfirm('完成工单', `确认将工单 ${o.no} 标记为已完成?`, () => {
+    orderList.value = transitionOrder(orderList.value, o.no, 'done')
+  })
+}
+
+// 「查看设备」:已完成页 → 跳设备详情
+function viewDevice(o: WorkOrder) {
+  router.push(`/device/detail/${o.deviceId}`)
+}
+
+// 点工单编号 / 查看工单 → 进工单详情
+function goDetail(no: string) {
+  router.push(`/order/detail/${no}`)
 }
 
 /* ============= 确认弹框 ============= */
@@ -98,28 +116,6 @@ function doConfirm() {
   const cb = confirmState.value.onConfirm
   confirmState.value.show = false
   cb()
-}
-
-// 「开始处理」:pending → processing
-function startProcess(o: WorkOrder) {
-  openConfirm('开始处理工单', `确认将工单 ${o.no} 设为处理中状态?`, () => {
-    o.status = 'processing'
-    persist()
-  })
-}
-
-// 「完成」:processing → done,写入完成时间
-function completeOrder(o: WorkOrder) {
-  openConfirm('完成工单', `确认将工单 ${o.no} 标记为已完成?`, () => {
-    o.status = 'done'
-    o.finishTime = nowStr()
-    persist()
-  })
-}
-
-// 「查看设备」:已完成页 → 跳设备详情
-function viewDevice(o: WorkOrder) {
-  router.push(`/device/detail/${o.deviceId}`)
 }
 
 /* ============= 跳创建工单 ============= */
@@ -171,7 +167,9 @@ const emptyText = computed(() => {
         </thead>
         <tbody>
           <tr v-for="o in pagedList" :key="o.no">
-            <td>{{ o.no }}</td>
+            <td>
+              <button class="link-btn mono" @click="goDetail(o.no)">{{ o.no }}</button>
+            </td>
             <td>{{ o.deviceName }}</td>
             <td class="ellipsis-cell">{{ o.desc }}</td>
             <td>
@@ -181,27 +179,30 @@ const emptyText = computed(() => {
             </td>
             <td>{{ activeTab === 'done' ? o.finishTime : o.createTime }}</td>
             <td>
-              <button
-                v-if="o.status === 'pending'"
-                class="link-btn"
-                @click="startProcess(o)"
-              >
-                开始处理
-              </button>
-              <button
-                v-else-if="o.status === 'processing'"
-                class="link-btn"
-                @click="completeOrder(o)"
-              >
-                完成
-              </button>
-              <button
-                v-else
-                class="link-btn"
-                @click="viewDevice(o)"
-              >
-                查看设备
-              </button>
+              <div class="ops">
+                <button
+                  v-if="o.status === 'pending'"
+                  class="link-btn"
+                  @click="startProcess(o)"
+                >
+                  开始处理
+                </button>
+                <button
+                  v-else-if="o.status === 'processing'"
+                  class="link-btn"
+                  @click="completeOrder(o)"
+                >
+                  完成
+                </button>
+                <button
+                  v-else
+                  class="link-btn"
+                  @click="viewDevice(o)"
+                >
+                  查看设备
+                </button>
+                <button class="link-btn" @click="goDetail(o.no)">详情</button>
+              </div>
             </td>
           </tr>
         </tbody>
@@ -366,6 +367,10 @@ const emptyText = computed(() => {
   padding: 0;
 }
 .link-btn:hover { text-decoration: underline; }
+/* 工单编号用等宽字体,列表里对齐好看 */
+.link-btn.mono { font-family: ui-monospace, monospace; }
+/* 操作列多个按钮之间的间隔 */
+.ops { display: flex; gap: 14px; align-items: center; }
 
 /* 状态/优先级标签 */
 .tag {

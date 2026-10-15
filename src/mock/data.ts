@@ -9,6 +9,8 @@
  * 命名固定,后面四个业务页面从这里取数据,导出名一个都不能改
  */
 
+import { nowStr } from '@/utils/format'
+
 /* ============= 设备状态/类型相关 ============= */
 
 /** 设备状态映射:状态 key -> {中文文字, 颜色类名(对应 .tag-green / .tag-red / .tag-gray / .tag-orange)} */
@@ -85,9 +87,18 @@ export const PRIORITY: Record<string, { label: string; color: string }> = {
   low:  { label: '低', color: 'green' },
 }
 
+/** 单条工单的操作日志项(日志按时间正序排列) */
+export interface OrderLogEntry {
+  status: WorkOrder['status'] // 产生这条日志时工单所处的状态
+  label: string               // 中文动作名:创建工单 / 开始处理 / 完成工单
+  time: string                // YYYY-MM-DD HH:mm
+  operator: string            // 操作人
+  note: string                // 说明文案
+}
+
 /** 工单接口 */
 export interface WorkOrder {
-  no: string         // 工单号 WO-YYYYMMDDNNN
+  no: string         // 工单号 WO-YYMMDDNNN(年份两位,与种子数据一致)
   deviceId: string   // 关联设备编号
   deviceName: string // 关联设备名称(冗余存储,显示不用再回查)
   desc: string       // 故障描述(5-30 字中文)
@@ -95,14 +106,16 @@ export interface WorkOrder {
   status: 'pending' | 'processing' | 'done'
   createTime: string // 创建时间 YYYY-MM-DD HH:mm
   finishTime: string // 完成时间(已完成工单填,其他空字符串)
+  opLog: OrderLogEntry[] // 操作日志(按时间正序)
 }
 
 /* ============= 种子工单 12 条 =====================
  * 状态分布:待处理 5 / 处理中 3 / 已完成 4
  * 全部集中在 2026-10-13 一天,序号 001~012
  * deviceName 与 DEVICES 里对应 id 的 name 完全一致(★一票否决)
+ * opLog 不在这里写死:首次读取时由 migrateOrders 按创建/完成时间统一补出来
  * =============================================== */
-const SEED_ORDERS: WorkOrder[] = [
+const SEED_ORDERS: Array<Omit<WorkOrder, 'opLog'>> = [
   // 待处理 5 条
   { no: 'WO-261013001', deviceId: 'EQ-1005', deviceName: '数控磨床 GM-720',     desc: '主轴异响,加工精度超差', priority: 'high', status: 'pending',    createTime: '2026-10-13 08:23', finishTime: '' },
   { no: 'WO-261013002', deviceId: 'EQ-1009', deviceName: '注塑机 IM-450',       desc: '液压油温过高报警',       priority: 'mid',  status: 'pending',    createTime: '2026-10-13 09:15', finishTime: '' },
@@ -125,23 +138,108 @@ const SEED_ORDERS: WorkOrder[] = [
 /** localStorage 键名(版本号后缀,以后改结构时可避免老数据冲突) */
 const ORDERS_KEY = 'fop_orders_v1'
 
+/** 老工单的兜底操作人(登录用户读不到时用) */
+function currentOperator(): string {
+  try {
+    const auth = localStorage.getItem('fop_auth_v1')
+    if (auth) {
+      const u = JSON.parse(auth).user
+      if (u) return String(u)
+    }
+  } catch {
+    // localStorage 被禁用 / JSON 坏了:走默认值
+  }
+  return '系统管理员'
+}
+
+/** 给单条工单补出操作日志(老数据没有 opLog 字段时用) */
+function backfillOpLog(o: Omit<WorkOrder, 'opLog'>): OrderLogEntry[] {
+  const logs: OrderLogEntry[] = [
+    {
+      status: 'pending',
+      label: '创建工单',
+      time: o.createTime,
+      operator: currentOperator(),
+      note: `登记故障：${o.desc}`,
+    },
+  ]
+  if (o.status === 'processing' || o.status === 'done') {
+    logs.push({
+      status: 'processing',
+      label: '开始处理',
+      time: o.createTime,
+      operator: currentOperator(),
+      note: '已派工，进入处理中',
+    })
+  }
+  if (o.status === 'done') {
+    logs.push({
+      status: 'done',
+      label: '完成工单',
+      time: o.finishTime || o.createTime,
+      operator: currentOperator(),
+      note: '故障已排除，设备恢复使用',
+    })
+  }
+  return logs
+}
+
+/** 数据迁移:保证每条工单都有 opLog 字段(兼容加字段之前存下的老数据) */
+function migrateOrders(list: Array<Partial<WorkOrder>>): WorkOrder[] {
+  return list.map((o) => ({
+    ...o,
+    opLog: Array.isArray(o.opLog) && o.opLog.length ? o.opLog : backfillOpLog(o as Omit<WorkOrder, 'opLog'>),
+  })) as WorkOrder[]
+}
+
 /** 从 localStorage 读工单;读不到(第一次访问)就写入 12 条种子再返回 */
 export function loadOrders(): WorkOrder[] {
   try {
     const raw = localStorage.getItem(ORDERS_KEY)
     if (raw) {
-      const list = JSON.parse(raw) as WorkOrder[]
-      if (Array.isArray(list)) return list
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) {
+        const list = migrateOrders(parsed)
+        // 迁移过就顺手写回,下次读取不用再补
+        if (list.some((_, i) => (parsed[i] as Partial<WorkOrder>)?.opLog === undefined)) {
+          saveOrders(list)
+        }
+        return list
+      }
     }
   } catch {
     // JSON 解析失败也走种子写入分支
   }
   // 第一次访问 / 解析失败:写入种子并返回
-  saveOrders(SEED_ORDERS)
-  return SEED_ORDERS
+  const seeded = migrateOrders(SEED_ORDERS)
+  saveOrders(seeded)
+  return seeded
 }
 
 /** 把工单数组写回 localStorage */
 export function saveOrders(list: WorkOrder[]): void {
   localStorage.setItem(ORDERS_KEY, JSON.stringify(list))
+}
+
+/** 工单状态流转:改状态(+完成时间)并写入一条操作日志,返回新数组 */
+export function transitionOrder(list: WorkOrder[], no: string, to: WorkOrder['status']): WorkOrder[] {
+  const time = nowStr()
+  const next = list.map((o) => {
+    if (o.no !== no) return o
+    const item: OrderLogEntry = {
+      status: to,
+      label: to === 'processing' ? '开始处理' : '完成工单',
+      time,
+      operator: currentOperator(),
+      note: to === 'processing' ? '已派工，进入处理中' : '故障已排除，设备恢复使用',
+    }
+    return {
+      ...o,
+      status: to,
+      finishTime: to === 'done' ? time : o.finishTime,
+      opLog: [...(o.opLog || []), item],
+    }
+  })
+  saveOrders(next)
+  return next
 }

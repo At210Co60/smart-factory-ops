@@ -21,8 +21,7 @@ const router = createRouter({
       redirect: '/home',
       component: () => import('@/layouts/BasicLayout.vue'),
       meta: { requiresAuth: true },
-      children: [
-        // 数据看板模块
+      children: [        // 数据看板模块
         {
           path: 'home',
           component: () => import('@/views/home/index.vue'),
@@ -39,6 +38,18 @@ const router = createRouter({
           component: () => import('@/views/device/detail.vue'),
           meta: { title: '设备详情' },
         },
+        // 维护计划模块(事前保养)
+        {
+          path: 'plan/list',
+          component: () => import('@/views/plan/list.vue'),
+          meta: { title: '维护计划' },
+        },
+        // 备件库存模块(维修物料)
+        {
+          path: 'spare/list',
+          component: () => import('@/views/spare/list.vue'),
+          meta: { title: '备件库存' },
+        },
         // 工单管理模块
         {
           path: 'order/list',
@@ -46,10 +57,18 @@ const router = createRouter({
           meta: { title: '工单管理' },
         },
         {
+          path: 'order/detail/:no',
+          component: () => import('@/views/order/detail.vue'),
+          meta: { title: '工单详情' },
+        },
+        {
           path: 'order/create',
           component: () => import('@/views/order/create.vue'),
           meta: { title: '创建工单' },
         },
+        // 兜底：地址写错或指向已删除的页面时，不要停在空白页（只剩侧栏和顶栏），
+        // 直接送回数据看板
+        { path: ':pathMatch(.*)*', redirect: '/home' },
       ],
     },
   ],
